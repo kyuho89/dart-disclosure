@@ -1,0 +1,7 @@
+# 개인 키/데이터 — 절대 커밋 금지
+.dart_api_key
+watchlist.txt
+.streamlit/secrets.toml
+
+__pycache__/
+*.pyc
