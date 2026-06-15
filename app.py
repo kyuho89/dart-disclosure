@@ -167,11 +167,11 @@ def get_secret_api_key() -> str:
 def load_portfolio_key() -> dict:
     """서비스 계정 키 로드: 배포 환경은 Streamlit Secrets, 로컬은 JSON 파일."""
     try:
-        # Streamlit Cloud: Secrets > [gcp_service_account] 섹션
-        return dict(st.secrets["gcp_service_account"])
+        # Streamlit Cloud: Secrets에 GCP_KEY = '{ ... }' 형태로 저장
+        return json.loads(st.secrets["GCP_KEY"])
     except Exception:
         # 로컬: 하드코딩된 파일 경로
-        return load_portfolio_key()
+        return json.loads(PORTFOLIO_KEY_FILE.read_text(encoding="utf-8"))
 
 
 def load_api_key() -> str:
