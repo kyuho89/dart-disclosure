@@ -164,6 +164,16 @@ def get_secret_api_key() -> str:
         return ""
 
 
+def load_portfolio_key() -> dict:
+    """서비스 계정 키 로드: 배포 환경은 Streamlit Secrets, 로컬은 JSON 파일."""
+    try:
+        # Streamlit Cloud: Secrets > [gcp_service_account] 섹션
+        return dict(st.secrets["gcp_service_account"])
+    except Exception:
+        # 로컬: 하드코딩된 파일 경로
+        return load_portfolio_key()
+
+
 def load_api_key() -> str:
     """저장된 키 → 환경변수 순으로 불러온다."""
     if API_KEY_FILE.exists():
@@ -414,7 +424,7 @@ def render_portfolio_tab() -> None:
     # ── 자동 로드 ───────────────────────────────────────────
     if "portfolio_df" not in st.session_state:
         try:
-            key_dict = json.loads(PORTFOLIO_KEY_FILE.read_text(encoding="utf-8"))
+            key_dict = load_portfolio_key()
             df = load_portfolio_from_gsheet(key_dict, PORTFOLIO_SHEET_URL)
             st.session_state["portfolio_df"] = df
         except Exception as e:
@@ -423,7 +433,7 @@ def render_portfolio_tab() -> None:
 
     if st.button("🔄 새로고침", key="btn_pf_reload"):
         try:
-            key_dict = json.loads(PORTFOLIO_KEY_FILE.read_text(encoding="utf-8"))
+            key_dict = load_portfolio_key()
             df = load_portfolio_from_gsheet(key_dict, PORTFOLIO_SHEET_URL)
             st.session_state["portfolio_df"] = df
             st.rerun()
