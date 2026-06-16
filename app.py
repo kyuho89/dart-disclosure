@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 """DART 공시 조회 Streamlit 앱 (OpenDART API 사용)"""
 
+import io
 import json
 import os
 import re
 from datetime import date, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import pandas as pd
 import requests
 import streamlit as st
 
 CORP_SEARCH_URL = "https://dart.fss.or.kr/dsae001/search.ax"
+GNEWS_RSS_URL = "https://news.google.com/rss/search"
 LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 VIEWER_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo="
 
@@ -245,7 +249,9 @@ def load_portfolio_from_gsheet(key_dict: dict, sheet_url: str) -> pd.DataFrame:
         raise ValueError(f"시트에 다음 컬럼이 없습니다: {missing}")
 
     df = df[cols].copy()
-    df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
+    df["종목코드"] = df["종목코드"].astype(str).apply(
+        lambda x: x.strip().zfill(6) if x.strip().isdigit() else x.strip()
+    )
     for col in ["수량", "현재가격", "평가금액", "매수가격"]:
         df[col] = pd.to_numeric(
             df[col].astype(str).str.replace(",", "").str.replace(" ", ""),
@@ -293,6 +299,52 @@ def fetch_portfolio_prices(codes: tuple[str, ...], download_from: str) -> pd.Dat
                 close = close.iloc[:, 0]
             frames[code] = close
             break
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, axis=1)
+    combined.index = pd.to_datetime(combined.index).normalize()
+    return combined
+
+
+@st.cache_data(ttl=300, show_spinner="미국 주가 로딩 중...")
+def fetch_us_prices(tickers: tuple[str, ...], download_from: str) -> pd.DataFrame:
+    """미국 종목 티커로 일별 종가 조회."""
+    import yfinance as yf
+
+    frames: dict[str, pd.Series] = {}
+    for ticker in tickers:
+        data = yf.download(ticker, start=download_from, progress=False, auto_adjust=True)
+        if data.empty:
+            continue
+        close = data["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        frames[ticker] = close
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, axis=1)
+    combined.index = pd.to_datetime(combined.index).normalize()
+    return combined
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_us_index_prices(download_from: str) -> pd.DataFrame:
+    """S&P500(^GSPC)과 NASDAQ(^IXIC) 일별 종가 조회."""
+    import yfinance as yf
+
+    frames: dict[str, pd.Series] = {}
+    for name, ticker in [("S&P500", "^GSPC"), ("NASDAQ", "^IXIC")]:
+        data = yf.download(ticker, start=download_from, progress=False, auto_adjust=True)
+        if data.empty:
+            continue
+        close = data["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        frames[name] = close
 
     if not frames:
         return pd.DataFrame()
@@ -417,7 +469,7 @@ def render_company_tab(api_key: str, bgn: date, end: date, pblntf_ty: str | None
 
 
 def render_portfolio_tab() -> None:
-    """탭: 포트폴리오 원 그래프 + 기간별 수익률 선그래프 (매수가격 기준선 포함)."""
+    """탭: 포트폴리오 원 그래프 + 수익률 비교 선그래프."""
     import plotly.express as px
     import plotly.graph_objects as go
 
@@ -444,12 +496,9 @@ def render_portfolio_tab() -> None:
     if portfolio_df is None or portfolio_df.empty:
         return
 
-    total = portfolio_df["평가금액"].sum()
-    st.metric("총 평가금액", f"{total:,.0f}원")
+    # ── 상단: 원 그래프 | 종목별 수익률 표 ────────────────
+    col_pie, col_table = st.columns([1, 1])
 
-    col_pie, col_gap, col_line = st.columns([1, 0.08, 2])
-
-    # ── 원 그래프 ──────────────────────────────────────────
     with col_pie:
         st.subheader("평가금액 비중")
         fig_pie = px.pie(
@@ -458,109 +507,132 @@ def render_portfolio_tab() -> None:
             names="종목명",
             hole=0.35,
         )
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
+        fig_pie.update_traces(
+            textposition="inside",
+            textinfo="percent+label",
+            hovertemplate="<b>%{label}</b><br>%{percent}<extra></extra>",
+        )
         fig_pie.update_layout(showlegend=False, margin=dict(t=10, b=0, l=0, r=0))
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # ── YTD 수익률 선그래프 ────────────────────────────────
-    with col_line:
-        today = date.today()
-        base_date = date(today.year - 1, 12, 31)
-        base_date_str = base_date.strftime("%Y/%m/%d")
-        st.subheader(f"YTD 수익률 (기준일: {base_date_str})")
-        download_from = base_date - timedelta(days=7)
+    with col_table:
+        st.subheader("종목별 수익률")
+        tbl = portfolio_df[["종목명", "매수가격", "현재가격", "평가금액"]].copy()
+        tbl["수익률(%)"] = (tbl["현재가격"] / tbl["매수가격"] - 1) * 100
+        tbl = tbl.sort_values("평가금액", ascending=False).reset_index(drop=True)
+        tbl = tbl.rename(columns={"매수가격": "매수금액"})
 
-        codes = tuple(portfolio_df["종목코드"].tolist())
-        code_to_name = dict(zip(portfolio_df["종목코드"], portfolio_df["종목명"]))
-        code_to_buy = dict(zip(portfolio_df["종목코드"], portfolio_df["매수가격"]))
+        def _color_return(v):
+            if v > 0:
+                return "color: #39FF14; font-weight: bold"
+            elif v < 0:
+                return "color: #FF3333; font-weight: bold"
+            return ""
 
-        price_df = fetch_portfolio_prices(codes, download_from.strftime("%Y-%m-%d"))
+        styled = (
+            tbl[["종목명", "매수금액", "현재가격", "수익률(%)"]]
+            .style
+            .applymap(_color_return, subset=["수익률(%)"])
+            .format({"매수금액": "{:,.0f}", "현재가격": "{:,.0f}", "수익률(%)": "{:+.2f}%"})
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
+    # ── 하단: 수익률 비교 선그래프 ────────────────────────
+    today = date.today()
+    base_date = date(today.year - 1, 12, 31)
+    base_date_str = base_date.strftime("%Y/%m/%d")
+    download_from = base_date - timedelta(days=7)
+    base_ts = pd.Timestamp(base_date)
+
+    palette = [
+        "#E63946", "#2196F3", "#4CAF50", "#FF9800", "#9C27B0",
+        "#00BCD4", "#FF5722", "#8BC34A", "#F06292", "#FFD600",
+    ]
+
+    def _draw_return_chart(price_df, keys, name_map, idx_df, idx_styles):
         if price_df.empty:
-            st.warning("주가 데이터를 가져올 수 없습니다. 종목코드를 확인하세요.")
-        else:
-            base_ts = pd.Timestamp(base_date)
-            past = price_df[price_df.index <= base_ts]
-            base_prices = past.iloc[-1] if not past.empty else price_df.iloc[0]
-            chart_df = price_df[price_df.index >= base_ts]
+            st.warning("주가 데이터를 가져올 수 없습니다.")
+            return
+        past = price_df[price_df.index <= base_ts]
+        base_prices = past.iloc[-1] if not past.empty else price_df.iloc[0]
+        chart_df = price_df[price_df.index >= base_ts]
+        if chart_df.empty:
+            st.warning("차트 데이터가 없습니다.")
+            return
 
-            if chart_df.empty:
-                st.warning("차트 데이터가 없습니다.")
-            else:
-                # 뚜렷한 색상 팔레트
-                palette = [
-                    "#E63946", "#2196F3", "#4CAF50", "#FF9800", "#9C27B0",
-                    "#00BCD4", "#FF5722", "#8BC34A", "#F06292", "#FFD600",
-                ]
-                x_start = chart_df.index[0]
-                x_end = chart_df.index[-1]
-                fig = go.Figure()
+        fig = go.Figure()
+        for i, key in enumerate(keys):
+            if key not in chart_df.columns:
+                continue
+            name = name_map.get(key, key)
+            color = palette[i % len(palette)]
+            base_val = float(base_prices[key]) if pd.notna(base_prices.get(key, None)) else None
+            if not base_val:
+                continue
+            fig.add_trace(go.Scatter(
+                x=chart_df.index, y=chart_df[key] / base_val,
+                mode="lines", name=name,
+                line=dict(color=color, width=2.5),
+                hovertemplate=f"{name}: %{{y:.4f}}<extra></extra>",
+                legend="legend",
+            ))
 
-                for i, code in enumerate(codes):
-                    if code not in chart_df.columns:
-                        continue
-                    name = code_to_name.get(code, code)
-                    color = palette[i % len(palette)]
-                    base_val = float(base_prices[code]) if pd.notna(base_prices.get(code, None)) else None
-                    if not base_val:
-                        continue
+        for idx_name, style in idx_styles.items():
+            if idx_name not in idx_df.columns:
+                continue
+            idx_past = idx_df[idx_df.index <= base_ts]
+            idx_base = float(idx_past[idx_name].iloc[-1]) if not idx_past.empty else float(idx_df[idx_name].iloc[0])
+            if not idx_base:
+                continue
+            idx_chart = idx_df[idx_df.index >= base_ts]
+            fig.add_trace(go.Scatter(
+                x=idx_chart.index, y=idx_chart[idx_name] / idx_base,
+                mode="lines", name=idx_name, line=style,
+                hovertemplate=f"{idx_name}: %{{y:.4f}}<extra></extra>",
+                legend="legend2",
+            ))
 
-                    # 정규화 주가 선
-                    fig.add_trace(go.Scatter(
-                        x=chart_df.index,
-                        y=chart_df[code] / base_val,
-                        mode="lines",
-                        name=name,
-                        line=dict(color=color, width=2.5),
-                        hovertemplate=f"{name}: %{{y:.4f}}<extra></extra>",
-                    ))
+        fig.add_hline(y=1.0, line_dash="dash", line_color="gray", opacity=0.4)
+        fig.update_layout(
+            yaxis_title="정규화 수익률 (기준=1)", xaxis_title="",
+            hovermode="x unified",
+            legend=dict(title="종목", orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            legend2=dict(title="지수", orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(t=60, b=0, l=0, r=0),
+        )
+        fig.update_xaxes(range=[pd.Timestamp(base_date), chart_df.index[-1]])
+        st.plotly_chart(fig, use_container_width=True)
 
-                    # 매수가격 기준선 (점선, 동일 색상)
-                    buy_price = code_to_buy.get(code)
-                    if pd.notna(buy_price) and float(buy_price) > 0:
-                        norm_buy = float(buy_price) / base_val
-                        fig.add_trace(go.Scatter(
-                            x=[x_start, x_end],
-                            y=[norm_buy, norm_buy],
-                            mode="lines",
-                            name=f"{name} 매수가 ({int(buy_price):,}원)",
-                            line=dict(color=color, dash="dot", width=1.5),
-                            hovertemplate=f"{name} 매수가: {int(buy_price):,}원 (정규화 {norm_buy:.4f})<extra></extra>",
-                        ))
+    # 한국/미국 종목 분리
+    kr_df = portfolio_df[portfolio_df["종목코드"].str.isdigit()]
+    us_df = portfolio_df[~portfolio_df["종목코드"].str.isdigit()].copy()
 
-                # KOSPI / KOSDAQ 지수선
-                idx_df = fetch_index_prices(download_from.strftime("%Y-%m-%d"))
-                index_styles = {
-                    "KOSPI":  dict(color="#CC00FF", width=3, dash="solid"),   # 형광 보라
-                    "KOSDAQ": dict(color="#39FF14", width=3, dash="solid"),   # 형광 연두
-                }
-                for idx_name, style in index_styles.items():
-                    if idx_name not in idx_df.columns:
-                        continue
-                    idx_past = idx_df[idx_df.index <= base_ts]
-                    idx_base = float(idx_past[idx_name].iloc[-1]) if not idx_past.empty else float(idx_df[idx_name].iloc[0])
-                    if not idx_base:
-                        continue
-                    idx_chart = idx_df[idx_df.index >= base_ts]
-                    fig.add_trace(go.Scatter(
-                        x=idx_chart.index,
-                        y=idx_chart[idx_name] / idx_base,
-                        mode="lines",
-                        name=idx_name,
-                        line=style,
-                        hovertemplate=f"{idx_name}: %{{y:.4f}}<extra></extra>",
-                    ))
+    # ── 한국 주식 ──────────────────────────────────────────
+    if not kr_df.empty:
+        kr_codes = tuple(kr_df["종목코드"].tolist())
+        kr_name_map = dict(zip(kr_df["종목코드"], kr_df["종목명"]))
+        st.subheader(f"한국 주식 수익률 비교 (기준일: {base_date_str})")
+        _draw_return_chart(
+            fetch_portfolio_prices(kr_codes, download_from.strftime("%Y-%m-%d")),
+            kr_codes, kr_name_map,
+            fetch_index_prices(download_from.strftime("%Y-%m-%d")),
+            {"KOSPI": dict(color="#CC00FF", width=3, dash="solid"),
+             "KOSDAQ": dict(color="#39FF14", width=3, dash="solid")},
+        )
 
-                fig.add_hline(y=1.0, line_dash="dash", line_color="gray", opacity=0.4)
-                fig.update_layout(
-                    yaxis_title="정규화 수익률 (기준=1)",
-                    xaxis_title="",
-                    hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    margin=dict(t=30, b=0, l=0, r=0),
-                )
-                fig.update_xaxes(range=[pd.Timestamp(base_date), chart_df.index[-1]])
-                st.plotly_chart(fig, use_container_width=True)
+    # ── 미국 주식 ──────────────────────────────────────────
+    if not us_df.empty:
+        us_df["ticker"] = us_df["종목코드"]
+        us_tickers = tuple(us_df["ticker"].tolist())
+        us_name_map = dict(zip(us_df["ticker"], us_df["종목명"]))
+        st.subheader(f"미국 주식 수익률 비교 (기준일: {base_date_str})")
+        _draw_return_chart(
+            fetch_us_prices(us_tickers, download_from.strftime("%Y-%m-%d")),
+            us_tickers, us_name_map,
+            fetch_us_index_prices(download_from.strftime("%Y-%m-%d")),
+            {"S&P500": dict(color="#CC00FF", width=3, dash="solid"),
+             "NASDAQ": dict(color="#39FF14", width=3, dash="solid")},
+        )
 
 
 def render_watchlist_tab(
@@ -678,6 +750,112 @@ def render_watchlist_tab(
     render_disclosure_table(merged, show_company=True)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_news(company_name: str) -> pd.DataFrame:
+    """구글 뉴스 RSS에서 종목명으로 기사를 검색해 DataFrame으로 반환."""
+    try:
+        resp = requests.get(
+            GNEWS_RSS_URL,
+            params={"q": company_name, "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    for item in root.findall(".//item"):
+        title = item.findtext("title", "").strip()
+        link = item.findtext("link", "").strip()
+        pub_date_str = item.findtext("pubDate", "")
+        source_el = item.find("source")
+        source = source_el.text.strip() if source_el is not None and source_el.text else ""
+
+        try:
+            pub_date = parsedate_to_datetime(pub_date_str).date()
+        except Exception:
+            pub_date = None
+
+        if title and link:
+            rows.append({"날짜": pub_date, "종목명": company_name, "제목": title, "링크": link, "언론사": source})
+
+    return pd.DataFrame(rows)
+
+
+def render_news_tab() -> None:
+    """포트폴리오 종목들의 구글 뉴스를 조회해 표시."""
+    portfolio_df = st.session_state.get("portfolio_df")
+    if portfolio_df is None or portfolio_df.empty:
+        st.info("먼저 **📈 포트폴리오** 메뉴에서 구글 시트를 불러오세요.")
+        return
+
+    names = portfolio_df["종목명"].tolist()
+
+    col_filter, col_date, col_btn = st.columns([2, 2, 1], vertical_alignment="bottom")
+    with col_filter:
+        picked = st.selectbox("종목 필터", ["전체"] + names, key="news_company_filter")
+    with col_date:
+        today = date.today()
+        dates = st.date_input(
+            "조회 기간",
+            value=(today - timedelta(days=7), today),
+            max_value=today,
+            key="news_date_range",
+        )
+    with col_btn:
+        if st.button("🔄 새로고침", key="btn_news_reload", use_container_width=True):
+            fetch_news.clear()
+            st.rerun()
+
+    if isinstance(dates, tuple) and len(dates) == 2:
+        bgn_news, end_news = dates
+    else:
+        bgn_news, end_news = today - timedelta(days=7), today
+
+    target_names = names if picked == "전체" else [picked]
+
+    frames = []
+    progress = st.progress(0.0, text="뉴스 검색 중...")
+    for i, name in enumerate(target_names):
+        try:
+            df = fetch_news(name)
+            if not df.empty:
+                frames.append(df)
+        except Exception as e:
+            st.warning(f"{name} 뉴스 검색 실패: {e}")
+        progress.progress((i + 1) / len(target_names), text=f"뉴스 검색 중... ({i + 1}/{len(target_names)})")
+    progress.empty()
+
+    if not frames:
+        st.warning("검색된 뉴스가 없습니다.")
+        return
+
+    merged = pd.concat(frames, ignore_index=True)
+    merged = merged.dropna(subset=["날짜"])
+    merged = merged[(merged["날짜"] >= bgn_news) & (merged["날짜"] <= end_news)]
+    merged = merged.sort_values("날짜", ascending=False).reset_index(drop=True)
+
+    if merged.empty:
+        st.warning(f"{bgn_news} ~ {end_news} 기간에 검색된 뉴스가 없습니다.")
+        return
+
+    st.metric("뉴스 건수", f"{len(merged):,}건")
+
+    merged["제목_col"] = merged["링크"] + "#" + merged["제목"]
+    view = merged[["날짜", "종목명", "제목_col", "언론사"]].rename(columns={"제목_col": "제목"})
+
+    st.dataframe(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "제목": st.column_config.LinkColumn("제목", display_text=r"#(.*)", width="large"),
+        },
+    )
+
+
 def render_dart_portfolio_tab(
     api_key: str, bgn: date, end: date, pblntf_ty: str | None
 ) -> None:
@@ -744,6 +922,10 @@ def main():
                      type="primary" if st.session_state["page"] == "📋 DART 공시" else "secondary"):
             st.session_state["page"] = "📋 DART 공시"
             st.rerun()
+        if st.button("📰 뉴스", use_container_width=True,
+                     type="primary" if st.session_state["page"] == "📰 뉴스" else "secondary"):
+            st.session_state["page"] = "📰 뉴스"
+            st.rerun()
 
     page = st.session_state["page"]
 
@@ -751,6 +933,12 @@ def main():
     if page == "📈 포트폴리오":
         st.title("📈 포트폴리오")
         render_portfolio_tab()
+        return
+
+    # ── 뉴스 페이지 ─────────────────────────────────────────
+    if page == "📰 뉴스":
+        st.title("📰 포트폴리오 뉴스")
+        render_news_tab()
         return
 
     # ── DART 공시 페이지: 사이드바 설정 ────────────────────
@@ -768,8 +956,7 @@ def main():
             if "api_key" not in st.session_state:
                 st.session_state["api_key"] = load_api_key()
             api_key = st.text_input(
-                "OpenDART API 키",
-                type="password",
+                "DART API 키",
                 key="api_key",
                 on_change=lambda: save_api_key(st.session_state["api_key"]),
                 help="https://opendart.fss.or.kr 에서 발급한 인증키.",
