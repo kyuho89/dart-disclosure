@@ -529,11 +529,10 @@ def render_portfolio_tab() -> None:
                 return "color: #FF3333; font-weight: bold"
             return ""
 
-        styled = (
-            tbl[["종목명", "매수금액", "현재가격", "수익률(%)"]]
-            .style
-            .applymap(_color_return, subset=["수익률(%)"])
-            .format({"매수금액": "{:,.0f}", "현재가격": "{:,.0f}", "수익률(%)": "{:+.2f}%"})
+        _styler = tbl[["종목명", "매수금액", "현재가격", "수익률(%)"]].style
+        _style_fn = getattr(_styler, "map", None) or getattr(_styler, "applymap")
+        styled = _style_fn(_color_return, subset=["수익률(%)"]).format(
+            {"매수금액": "{:,.0f}", "현재가격": "{:,.0f}", "수익률(%)": "{:+.2f}%"}
         )
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -792,19 +791,18 @@ def render_news_tab() -> None:
         return
 
     names = portfolio_df["종목명"].tolist()
+    today = date.today()
 
-    col_filter, col_date, col_btn = st.columns([2, 2, 1], vertical_alignment="bottom")
-    with col_filter:
+    with st.sidebar:
+        st.divider()
+        st.header("설정")
         picked = st.selectbox("종목 필터", ["전체"] + names, key="news_company_filter")
-    with col_date:
-        today = date.today()
         dates = st.date_input(
             "조회 기간",
             value=(today - timedelta(days=7), today),
             max_value=today,
             key="news_date_range",
         )
-    with col_btn:
         if st.button("🔄 새로고침", key="btn_news_reload", use_container_width=True):
             fetch_news.clear()
             st.rerun()
