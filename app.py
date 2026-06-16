@@ -483,15 +483,6 @@ def render_portfolio_tab() -> None:
             st.error(f"포트폴리오 로드 실패: {e}")
             return
 
-    if st.button("🔄 새로고침", key="btn_pf_reload"):
-        try:
-            key_dict = load_portfolio_key()
-            df = load_portfolio_from_gsheet(key_dict, PORTFOLIO_SHEET_URL)
-            st.session_state["portfolio_df"] = df
-            st.rerun()
-        except Exception as e:
-            st.error(f"새로고침 실패: {e}")
-
     portfolio_df: pd.DataFrame | None = st.session_state.get("portfolio_df")
     if portfolio_df is None or portfolio_df.empty:
         return
@@ -796,13 +787,13 @@ def render_news_tab() -> None:
     with st.sidebar:
         st.divider()
         st.header("설정")
-        picked = st.selectbox("종목 필터", ["전체"] + names, key="news_company_filter")
         dates = st.date_input(
             "조회 기간",
             value=(today - timedelta(days=7), today),
             max_value=today,
             key="news_date_range",
         )
+        picked = st.selectbox("종목 필터", ["전체"] + names, key="news_company_filter")
         if st.button("🔄 새로고침", key="btn_news_reload", use_container_width=True):
             fetch_news.clear()
             st.rerun()
@@ -920,22 +911,32 @@ def main():
                      type="primary" if st.session_state["page"] == "📋 DART 공시" else "secondary"):
             st.session_state["page"] = "📋 DART 공시"
             st.rerun()
-        if st.button("📰 뉴스", use_container_width=True,
-                     type="primary" if st.session_state["page"] == "📰 뉴스" else "secondary"):
-            st.session_state["page"] = "📰 뉴스"
+        if st.button("📰 종목 뉴스", use_container_width=True,
+                     type="primary" if st.session_state["page"] == "📰 종목 뉴스" else "secondary"):
+            st.session_state["page"] = "📰 종목 뉴스"
             st.rerun()
 
     page = st.session_state["page"]
 
     # ── 포트폴리오 페이지 ───────────────────────────────────
     if page == "📈 포트폴리오":
+        with st.sidebar:
+            st.divider()
+            if st.button("🔄 새로고침", key="btn_pf_reload", use_container_width=True):
+                try:
+                    key_dict = load_portfolio_key()
+                    df = load_portfolio_from_gsheet(key_dict, PORTFOLIO_SHEET_URL)
+                    st.session_state["portfolio_df"] = df
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"새로고침 실패: {e}")
         st.title("📈 포트폴리오")
         render_portfolio_tab()
         return
 
     # ── 뉴스 페이지 ─────────────────────────────────────────
-    if page == "📰 뉴스":
-        st.title("📰 포트폴리오 뉴스")
+    if page == "📰 종목 뉴스":
+        st.title("📰 종목 뉴스")
         render_news_tab()
         return
 
@@ -981,6 +982,9 @@ def main():
             max_value=today,
         )
         ty_label = st.selectbox("공시 유형", list(PBLNTF_TY.keys()))
+        if st.button("🔄 새로고침", key="btn_dart_reload", use_container_width=True):
+            fetch_disclosures.clear()
+            st.rerun()
 
     if not api_key:
         st.info("사이드바에 OpenDART API 키를 입력하세요.")
