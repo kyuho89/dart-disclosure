@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import zipfile
 from datetime import date, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-CORP_SEARCH_URL = "https://dart.fss.or.kr/dsae001/search.ax"
+CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 GNEWS_RSS_URL = "https://news.google.com/rss/search"
 LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 VIEWER_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo="
@@ -46,52 +47,54 @@ PBLNTF_TY = {
 # ──────────────────────────────────────────────────────────
 # 데이터 조회
 # ──────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner="회사 검색 중...")
-def search_companies(keyword: str) -> pd.DataFrame:
-    """DART 사이트 회사검색. 회사명/종목코드 모두 검색 가능 (API 키 불필요)."""
-    resp = requests.post(
-        CORP_SEARCH_URL,
-        data={"currentPage": 1, "maxResults": 100, "textCrpNm": keyword.strip()},
-        headers={"User-Agent": "Mozilla/5.0"},
+@st.cache_data(ttl=86400, show_spinner="기업 코드 목록 로딩 중...")
+def _load_corp_code_df(api_key: str) -> pd.DataFrame:
+    """OpenDART API에서 전체 기업 코드 ZIP을 받아 DataFrame으로 반환 (24시간 캐시)."""
+    resp = requests.get(
+        CORP_CODE_URL,
+        params={"crtfc_key": api_key},
         timeout=30,
     )
     resp.raise_for_status()
-
-    rows = []
-    for tr in resp.text.split("<tr>")[1:]:
-        code_m = re.search(r"select\('(\d{8})'\)", tr)
-        name_m = re.search(r'title="(.+?) 기업개황', tr)
-        if not (code_m and name_m):
-            continue
-        stock_m = re.search(r"<td>\s*(\d{6})\s*</td>", tr)
-        market_m = re.search(r'tagCom_\w+"?\s+title="([^"]+)"', tr)
-        rows.append(
-            {
-                "corp_code": code_m.group(1),
-                "corp_name": name_m.group(1).strip(),
-                "stock_code": stock_m.group(1) if stock_m else "",
-                "market": market_m.group(1) if market_m else "",
-            }
-        )
-    return pd.DataFrame(rows, columns=["corp_code", "corp_name", "stock_code", "market"])
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+        xml_data = z.read("CORPCODE.xml")
+    root = ET.fromstring(xml_data)
+    rows = [
+        {
+            "corp_code": el.findtext("corp_code", "").strip(),
+            "corp_name": el.findtext("corp_name", "").strip(),
+            "stock_code": el.findtext("stock_code", "").strip(),
+        }
+        for el in root.findall("list")
+    ]
+    return pd.DataFrame(rows)
 
 
-def find_corp_by_name(name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def search_companies(keyword: str, api_key: str) -> pd.DataFrame:
+    """로컬 기업 코드 목록에서 keyword로 검색 (corp_name 포함 또는 stock_code 일치)."""
+    df = _load_corp_code_df(api_key)
+    kw = keyword.strip()
+    mask = df["corp_name"].str.contains(kw, na=False) | (df["stock_code"] == kw)
+    result = df[mask].copy()
+    result["market"] = ""
+    return result[["corp_code", "corp_name", "stock_code", "market"]]
+
+
+def find_corp_by_name(name: str, api_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """입력한 이름과 '정확히 일치'하는 회사만 반환. (일치 목록, 유사 목록)"""
     name = name.strip()
-    all_matches = search_companies(name)
+    all_matches = search_companies(name, api_key)
     if all_matches.empty:
         return all_matches, all_matches
     exact = all_matches[all_matches["corp_name"] == name]
     similar = all_matches[all_matches["corp_name"] != name]
-    # 동명 법인이 여러 개면 상장사 우선
     return exact.sort_values("stock_code", ascending=False), similar
 
 
-def find_corp_by_stock_code(stock_code: str) -> pd.Series | None:
+def find_corp_by_stock_code(stock_code: str, api_key: str) -> pd.Series | None:
     """종목코드(6자리)와 정확히 일치하는 상장사 반환. 없으면 None."""
-    matches = search_companies(stock_code)
-    exact = matches[matches["stock_code"] == stock_code]
+    df = _load_corp_code_df(api_key)
+    exact = df[df["stock_code"] == stock_code]
     return exact.iloc[0] if not exact.empty else None
 
 
@@ -415,7 +418,7 @@ def render_company_tab(api_key: str, bgn: date, end: date, pblntf_ty: str | None
         st.info("회사명을 입력하고 **조회** 버튼을 누르세요.")
         return
 
-    matches, similar = find_corp_by_name(company)
+    matches, similar = find_corp_by_name(company, api_key)
     if matches.empty:
         st.error(f"'{company}'와(과) 정확히 일치하는 회사가 없습니다.")
         if not similar.empty:
@@ -697,7 +700,7 @@ def render_watchlist_tab(
     frames, resolved, failed = [], [], []
     progress = st.progress(0.0, text="조회 중...")
     for i, code in enumerate(codes):
-        corp = find_corp_by_stock_code(code)
+        corp = find_corp_by_stock_code(code, api_key)
         if corp is None:
             failed.append(code)
         else:
@@ -859,7 +862,7 @@ def render_dart_portfolio_tab(
 
     progress = st.progress(0.0, text="공시 조회 중...")
     for i, code in enumerate(codes):
-        corp = find_corp_by_stock_code(code)
+        corp = find_corp_by_stock_code(code, api_key)
         if corp is not None:
             resolved.append(f"{corp['corp_name']}({code})")
             try:
