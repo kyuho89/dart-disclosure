@@ -961,19 +961,23 @@ def main():
                 help="https://opendart.fss.or.kr 에서 발급한 인증키.",
             )
         if api_key:
-            status, msg = check_api_key(api_key)
-            if status in ("000", "013"):
-                st.success("API 키 정상", icon="✅")
-            elif status == "011":
-                st.error("유효기간 만료", icon="❌")
-            elif status == "010":
-                st.error("등록되지 않은 키", icon="❌")
-            elif status == "020":
-                st.warning(f"요청 한도 초과: {msg}", icon="⚠️")
-            elif status == "ERR":
-                st.warning(f"키 상태 확인 실패: {msg}", icon="⚠️")
+            if deployed:
+                # Secrets에서 가져온 키는 확인 요청 없이 신뢰
+                st.success("API 키 설정됨 (Secrets)", icon="✅")
             else:
-                st.error(f"[{status}] {msg}", icon="❌")
+                status, msg = check_api_key(api_key)
+                if status in ("000", "013"):
+                    st.success("API 키 정상", icon="✅")
+                elif status == "011":
+                    st.error("유효기간 만료", icon="❌")
+                elif status == "010":
+                    st.error("등록되지 않은 키", icon="❌")
+                elif status == "020":
+                    st.warning(f"요청 한도 초과: {msg}", icon="⚠️")
+                elif status == "ERR":
+                    st.warning(f"키 상태 확인 실패: {msg}", icon="⚠️")
+                else:
+                    st.error(f"[{status}] {msg}", icon="❌")
 
         today = date.today()
         dates = st.date_input(
