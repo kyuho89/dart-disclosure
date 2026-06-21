@@ -5,7 +5,6 @@ import io
 import json
 import os
 import re
-import zipfile
 from datetime import date, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -15,7 +14,6 @@ import pandas as pd
 import requests
 import streamlit as st
 
-CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 GNEWS_RSS_URL = "https://news.google.com/rss/search"
 LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 VIEWER_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo="
@@ -47,32 +45,18 @@ PBLNTF_TY = {
 # ──────────────────────────────────────────────────────────
 # 데이터 조회
 # ──────────────────────────────────────────────────────────
-@st.cache_data(ttl=86400, show_spinner="기업 코드 목록 로딩 중...")
-def _load_corp_code_df(api_key: str) -> pd.DataFrame:
-    """OpenDART API에서 전체 기업 코드 ZIP을 받아 DataFrame으로 반환 (24시간 캐시)."""
-    resp = requests.get(
-        CORP_CODE_URL,
-        params={"crtfc_key": api_key},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-        xml_data = z.read("CORPCODE.xml")
-    root = ET.fromstring(xml_data)
-    rows = [
-        {
-            "corp_code": el.findtext("corp_code", "").strip(),
-            "corp_name": el.findtext("corp_name", "").strip(),
-            "stock_code": el.findtext("stock_code", "").strip(),
-        }
-        for el in root.findall("list")
-    ]
-    return pd.DataFrame(rows)
+CORP_CODE_CSV = Path(__file__).parent / "corp_codes.csv"
 
 
-def search_companies(keyword: str, api_key: str) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def _load_corp_code_df() -> pd.DataFrame:
+    """번들된 corp_codes.csv에서 기업 코드 목록 로드."""
+    return pd.read_csv(CORP_CODE_CSV, dtype=str).fillna("")
+
+
+def search_companies(keyword: str, api_key: str = "") -> pd.DataFrame:
     """로컬 기업 코드 목록에서 keyword로 검색 (corp_name 포함 또는 stock_code 일치)."""
-    df = _load_corp_code_df(api_key)
+    df = _load_corp_code_df()
     kw = keyword.strip()
     mask = df["corp_name"].str.contains(kw, na=False) | (df["stock_code"] == kw)
     result = df[mask].copy()
@@ -80,10 +64,10 @@ def search_companies(keyword: str, api_key: str) -> pd.DataFrame:
     return result[["corp_code", "corp_name", "stock_code", "market"]]
 
 
-def find_corp_by_name(name: str, api_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def find_corp_by_name(name: str, api_key: str = "") -> tuple[pd.DataFrame, pd.DataFrame]:
     """입력한 이름과 '정확히 일치'하는 회사만 반환. (일치 목록, 유사 목록)"""
     name = name.strip()
-    all_matches = search_companies(name, api_key)
+    all_matches = search_companies(name)
     if all_matches.empty:
         return all_matches, all_matches
     exact = all_matches[all_matches["corp_name"] == name]
@@ -91,9 +75,9 @@ def find_corp_by_name(name: str, api_key: str) -> tuple[pd.DataFrame, pd.DataFra
     return exact.sort_values("stock_code", ascending=False), similar
 
 
-def find_corp_by_stock_code(stock_code: str, api_key: str) -> pd.Series | None:
+def find_corp_by_stock_code(stock_code: str, api_key: str = "") -> pd.Series | None:
     """종목코드(6자리)와 정확히 일치하는 상장사 반환. 없으면 None."""
-    df = _load_corp_code_df(api_key)
+    df = _load_corp_code_df()
     exact = df[df["stock_code"] == stock_code]
     return exact.iloc[0] if not exact.empty else None
 
